@@ -26,7 +26,19 @@
  */
 
 #include <limits.h>
+#include <bzlib.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <string.h>
+#include <err.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <unistd.h>
+#include <fcntl.h>
 #include "bspatch.h"
+
+#define BLOCK_SIZE 256
 
 static int64_t offtin(uint8_t *buf)
 {
@@ -46,17 +58,21 @@ static int64_t offtin(uint8_t *buf)
 	return y;
 }
 
-int bspatch(const uint8_t* old, int64_t oldsize, uint8_t* new, int64_t newsize, struct bspatch_stream* stream)
+int bspatch(size_t newsize, struct bspatch_stream* stream, char *old_path, char *new_path)
 {
 	uint8_t buf[8];
-	int64_t oldpos,newpos;
+	size_t oldpos = 0;
+	size_t newpos = 0;
 	int64_t ctrl[3];
-	int64_t i;
+	uint8_t old[BLOCK_SIZE];
+	uint8_t new[BLOCK_SIZE];
 
-	oldpos=0;newpos=0;
+	FILE* fpold = fopen(old_path, "rb");
+	FILE* fpnew = fopen(new_path, "wb");
+
 	while(newpos<newsize) {
 		/* Read control data */
-		for(i=0;i<=2;i++) {
+		for(size_t i=0; i<=2; i++) {
 			if (stream->read(stream, buf, 8))
 				return -1;
 			ctrl[i]=offtin(buf);
@@ -68,29 +84,48 @@ int bspatch(const uint8_t* old, int64_t oldsize, uint8_t* new, int64_t newsize, 
 			newpos+ctrl[0]>newsize)
 			return -1;
 
-		/* Read diff string */
-		if (stream->read(stream, new + newpos, ctrl[0]))
-			return -1;
+		while(ctrl[0] > 0) {
+			int64_t bytesToRead = ctrl[0] > BLOCK_SIZE ? BLOCK_SIZE : ctrl[0];
+			if(stream->read(stream, new, bytesToRead)){
+				printf("Error reading diff string ctrl[0]\n");
+				return -1;
+			}
 
-		/* Add old data to diff string */
-		for(i=0;i<ctrl[0];i++)
-			if((oldpos+i>=0) && (oldpos+i<oldsize))
-				new[newpos+i]+=old[oldpos+i];
+			/* Add old data to diff string */
+			fseek(fpold, oldpos, SEEK_SET);
+			fread(old, sizeof(uint8_t), bytesToRead, fpold);
+			for(size_t i = 0; i < bytesToRead; i++) {
+				new[i] += old[i];
+			}
 
-		/* Adjust pointers */
-		newpos+=ctrl[0];
-		oldpos+=ctrl[0];
+			/* Write the diff string to the new file */
+			fwrite(new, sizeof(uint8_t), bytesToRead, fpnew);
+
+			/* Adjust pointers */
+			newpos += bytesToRead;
+			oldpos += bytesToRead;
+			ctrl[0] -= bytesToRead;
+		}
 
 		/* Sanity-check */
 		if(newpos+ctrl[1]>newsize)
 			return -1;
 
-		/* Read extra string */
-		if (stream->read(stream, new + newpos, ctrl[1]))
-			return -1;
+		/* Process the extra string */
+		while(ctrl[1] > 0) {
+			int64_t bytesToRead = ctrl[1] > BLOCK_SIZE ? BLOCK_SIZE : ctrl[1];
+			if(stream->read(stream, new, bytesToRead)) {
+				printf("Error reading extra string ctrl[1]\n");
+				return -1;
+			}
 
-		/* Adjust pointers */
-		newpos+=ctrl[1];
+			/* Write the extra string to the new file */
+			fwrite(new, sizeof(uint8_t), bytesToRead, fpnew);
+
+			/* Adjust pointers */
+			newpos += bytesToRead;
+			ctrl[1] -= bytesToRead;
+		}
 		oldpos+=ctrl[2];
 	};
 
@@ -98,17 +133,6 @@ int bspatch(const uint8_t* old, int64_t oldsize, uint8_t* new, int64_t newsize, 
 }
 
 #if defined(BSPATCH_EXECUTABLE)
-
-#include <bzlib.h>
-#include <stdlib.h>
-#include <stdint.h>
-#include <stdio.h>
-#include <string.h>
-#include <err.h>
-#include <sys/types.h>
-#include <sys/stat.h>
-#include <unistd.h>
-#include <fcntl.h>
 
 static int file_read(const struct bspatch_stream* stream, void* buffer, int length)
 {
@@ -125,60 +149,36 @@ static int file_read(const struct bspatch_stream* stream, void* buffer, int leng
 
 int main(int argc,char * argv[])
 {
-	FILE * f;
-	int fd;
-	uint8_t header[24];
-	uint8_t *old, *new;
-	int64_t oldsize, newsize;
+	FILE * patch_file;
+	uint8_t header[8];
+	size_t newsize;
 	struct bspatch_stream stream;
-	struct stat sb;
 
 	if(argc!=4) errx(1,"usage: %s oldfile newfile patchfile\n",argv[0]);
 
 	/* Open patch file */
-	if ((f = fopen(argv[3], "r")) == NULL)
+	if ((patch_file = fopen(argv[3], "r")) == NULL)
 		err(1, "fopen(%s)", argv[3]);
 
 	/* Read header */
-	if (fread(header, 1, 24, f) != 24) {
-		if (feof(f))
+	if (fread(header, 1, 8, patch_file) != 8) {
+		if (feof(patch_file))
 			errx(1, "Corrupt patch\n");
 		err(1, "fread(%s)", argv[3]);
 	}
 
-	/* Check for appropriate magic */
-	if (memcmp(header, "ENDSLEY/BSDIFF43", 16) != 0)
-		errx(1, "Corrupt patch\n");
-
 	/* Read lengths from header */
-	newsize=offtin(header+16);
+	newsize=offtin(header);
 	if(newsize<0)
 		errx(1,"Corrupt patch\n");
 
-	/* Close patch file and re-open it via libbzip2 at the right places */
-	if(((fd=open(argv[1],O_RDONLY,0))<0) ||
-		((oldsize=lseek(fd,0,SEEK_END))==-1) ||
-		((old=malloc(oldsize+1))==NULL) ||
-		(lseek(fd,0,SEEK_SET)!=0) ||
-		(read(fd,old,oldsize)!=oldsize) ||
-		(fstat(fd, &sb)) ||
-		(close(fd)==-1)) err(1,"%s",argv[1]);
-	if((new=malloc(newsize+1))==NULL) err(1,NULL);
 
 	stream.read = file_read;
-	stream.opaque = f;
-	if (bspatch(old, oldsize, new, newsize, &stream))
+	stream.opaque = patch_file;
+	if (bspatch(newsize, &stream, argv[1], argv[2]))
 		errx(1, "bspatch");
 
-	fclose(f);
-
-	/* Write the new file */
-	if(((fd=open(argv[2],O_CREAT|O_TRUNC|O_WRONLY,sb.st_mode))<0) ||
-		(write(fd,new,newsize)!=newsize) || (close(fd)==-1))
-		err(1,"%s",argv[2]);
-
-	free(new);
-	free(old);
+	fclose(patch_file);
 
 	return 0;
 }
