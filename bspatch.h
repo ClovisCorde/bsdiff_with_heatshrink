@@ -29,6 +29,13 @@
 # define BSPATCH_H
 
 # include <stdint.h>
+#include "heatshrink/heatshrink_decoder.h"
+
+typedef enum {
+    STATE_DECODE,
+    STATE_POLL,
+    STATE_FINISH
+} decoder_state_t;
 
 struct bspatch_stream
 {
@@ -36,7 +43,7 @@ struct bspatch_stream
 	int (*read)(const struct bspatch_stream* stream, void* buffer, int length);
 };
 
-int bspatch(size_t newsize, struct bspatch_stream* stream, char *old_path, char *new_path);
+int bspatch(size_t newsize, struct bspatch_stream* stream, char *old_path, char *new_path, FILE *patch_file, uint8_t *output_buffer, size_t *offset_buffer, heatshrink_decoder *hsd, size_t *bytes_written, decoder_state_t *state);
 
 #endif
 
