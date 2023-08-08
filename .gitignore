@@ -1,3 +1,5 @@
+/results
+/signed_images
 .deps/*
 .libs/*
 *.lo

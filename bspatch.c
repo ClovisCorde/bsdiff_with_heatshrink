@@ -110,14 +110,13 @@ int bspatch(const uint8_t* old, int64_t oldsize, uint8_t* new, int64_t newsize, 
 #include <unistd.h>
 #include <fcntl.h>
 
-static int bz2_read(const struct bspatch_stream* stream, void* buffer, int length)
+static int file_read(const struct bspatch_stream* stream, void* buffer, int length)
 {
 	int n;
-	int bz2err;
-	BZFILE* bz2;
+	FILE* file;
 
-	bz2 = (BZFILE*)stream->opaque;
-	n = BZ2_bzRead(&bz2err, bz2, buffer, length);
+	file = (FILE*)stream->opaque;
+	n = fread(buffer, 1, length, file);
 	if (n != length)
 		return -1;
 
@@ -128,11 +127,9 @@ int main(int argc,char * argv[])
 {
 	FILE * f;
 	int fd;
-	int bz2err;
 	uint8_t header[24];
 	uint8_t *old, *new;
 	int64_t oldsize, newsize;
-	BZFILE* bz2;
 	struct bspatch_stream stream;
 	struct stat sb;
 
@@ -168,16 +165,11 @@ int main(int argc,char * argv[])
 		(close(fd)==-1)) err(1,"%s",argv[1]);
 	if((new=malloc(newsize+1))==NULL) err(1,NULL);
 
-	if (NULL == (bz2 = BZ2_bzReadOpen(&bz2err, f, 0, 0, NULL, 0)))
-		errx(1, "BZ2_bzReadOpen, bz2err=%d", bz2err);
-
-	stream.read = bz2_read;
-	stream.opaque = bz2;
+	stream.read = file_read;
+	stream.opaque = f;
 	if (bspatch(old, oldsize, new, newsize, &stream))
 		errx(1, "bspatch");
 
-	/* Clean up the bzip2 reads */
-	BZ2_bzReadClose(&bz2err, bz2);
 	fclose(f);
 
 	/* Write the new file */
