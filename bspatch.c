@@ -44,25 +44,29 @@
 #define OUTPUT_READ_SIZE 256
 #define HEADER_SIZE 8
 
-static int decode(FILE *input, uint8_t *output_buffer, heatshrink_decoder *hsd, size_t *bytes_written, decoder_state_t *state) {
+static int decode(FILE *input, uint8_t *output_buffer, size_t output_buffer_size, heatshrink_decoder *hsd, size_t *bytes_written, decoder_state_t *state) {
     uint8_t input_buffer[INPUT_READ_SIZE];
     size_t read_sz = 0;
     size_t write_sz = 0;
     size_t offset_buffer = 0;
-    static size_t offset_file = 0;
+    static size_t offset_file = 16;
 
     /* Get size of the compressed file */
     fseek(input, 0L, SEEK_END);
     size_t file_size = ftell(input);
     fseek(input, offset_file, SEEK_SET);
 
+    size_t bytes_to_decode = output_buffer_size;
+    *state = STATE_DECODE;
+
     while (offset_file <= file_size)
     {
         switch (*state)
         {
         case STATE_DECODE: ;
-            size_t input_read = fread(input_buffer, 1, INPUT_READ_SIZE, input);
+            size_t input_read = fread(input_buffer, 1, 1, input);
             offset_file += input_read;
+     
             if(input_read == 0) {
                 *state = STATE_FINISH;
                 break;
@@ -84,27 +88,27 @@ static int decode(FILE *input, uint8_t *output_buffer, heatshrink_decoder *hsd, 
             break;
         case STATE_POLL: ;
             HSD_poll_res poll_res = HSDR_POLL_MORE;
-            while (poll_res != HSDR_POLL_EMPTY) {
-                size_t space_left = OUTPUT_BUFFER_SIZE - offset_buffer;
+            while (poll_res != HSDR_POLL_EMPTY && bytes_to_decode > 0) {
+                size_t space_left = output_buffer_size - offset_buffer;
                 size_t to_decode = space_left < OUTPUT_READ_SIZE ? space_left : OUTPUT_READ_SIZE;
                 poll_res = heatshrink_decoder_poll(hsd, output_buffer + offset_buffer, to_decode, &write_sz);
                 offset_buffer += write_sz;
-                
-                if (offset_buffer == OUTPUT_BUFFER_SIZE) {
-                    *bytes_written = offset_buffer;
-                    return HSDR_POLL_MORE;
-                }
+                bytes_to_decode -= write_sz;
+            }
+            if(bytes_to_decode == 0) {
+                *state = STATE_FINISH;
             }
             if(poll_res == HSDR_POLL_EMPTY) {
                 *state = STATE_DECODE;
             }
+            
             break;
         case STATE_FINISH: ;
             HSD_finish_res finish_res = heatshrink_decoder_finish(hsd);
             if (offset_buffer > 0) {
                 *bytes_written = offset_buffer;
-                return 0;
             }
+            
             return finish_res;
             break;
         
@@ -146,6 +150,11 @@ int bspatch(size_t newsize, struct bspatch_stream* stream, char *old_path, char 
 	FILE* fpnew = fopen(new_path, "wb");
 
 	while(newpos<newsize) {
+        if(*bytes_written == 0) {
+            decode(patch_file, output_buffer, 24, hsd, bytes_written, state);
+            heatshrink_decoder_reset(hsd);
+            *offset_buffer = 0;
+        }
 		/* Read control data */
 		for(size_t i=0; i<=2; i++) {
             memcpy(buf, output_buffer + *offset_buffer, HEADER_SIZE);
@@ -154,6 +163,7 @@ int bspatch(size_t newsize, struct bspatch_stream* stream, char *old_path, char 
 			ctrl[i]=offtin(buf);
 		};
         printf("ctrl[0] = %ld, ctrl[1] = %ld, ctrl[2] = %ld\n", ctrl[0], ctrl[1], ctrl[2]);
+        
 		/* Sanity-check */
 		if (ctrl[0]<0 || ctrl[0]>INT_MAX ||
 			ctrl[1]<0 || ctrl[1]>INT_MAX ||
@@ -161,15 +171,19 @@ int bspatch(size_t newsize, struct bspatch_stream* stream, char *old_path, char 
 			return -1;
 
 		while(ctrl[0] > 0) {
-            if(*offset_buffer == OUTPUT_BUFFER_SIZE) {
-                decode(patch_file, output_buffer, hsd, bytes_written, state);
+            if(*bytes_written == 0) {
+                int64_t decoded = ctrl[0] > OUTPUT_BUFFER_SIZE ? OUTPUT_BUFFER_SIZE : ctrl[0];
+                decode(patch_file, output_buffer, decoded, hsd, bytes_written, state);
+                if(*bytes_written < OUTPUT_BUFFER_SIZE) {
+                    heatshrink_decoder_reset(hsd);
+                }
                 *offset_buffer = 0;
             }
 			int64_t bytesToRead = ctrl[0] > OUTPUT_READ_SIZE ? OUTPUT_READ_SIZE : ctrl[0];
-            if(bytesToRead > (OUTPUT_BUFFER_SIZE - *offset_buffer)) {
-                bytesToRead = OUTPUT_BUFFER_SIZE - *offset_buffer;
+            if(bytesToRead > *bytes_written) {
+                bytesToRead = *bytes_written;
             }
-
+            
             memcpy(new, output_buffer + *offset_buffer, bytesToRead);
             *offset_buffer += bytesToRead;
             *bytes_written -= bytesToRead;
@@ -196,19 +210,22 @@ int bspatch(size_t newsize, struct bspatch_stream* stream, char *old_path, char 
 
 		/* Process the extra string */
 		while(ctrl[1] > 0) {
-            if(*offset_buffer == OUTPUT_BUFFER_SIZE) {
-                decode(patch_file, output_buffer, hsd, bytes_written, state);
+            if(*bytes_written == 0) {
+                int64_t decoded = ctrl[1] > OUTPUT_BUFFER_SIZE ? OUTPUT_BUFFER_SIZE : ctrl[1];
+                decode(patch_file, output_buffer, decoded, hsd, bytes_written, state);
+                if(*bytes_written < OUTPUT_BUFFER_SIZE) {
+                    heatshrink_decoder_reset(hsd);
+                }
                 *offset_buffer = 0;
             }
 			int64_t bytesToRead = ctrl[1] > OUTPUT_READ_SIZE ? OUTPUT_READ_SIZE : ctrl[1];
-            if(bytesToRead > (OUTPUT_BUFFER_SIZE - *offset_buffer)) {
-                bytesToRead = OUTPUT_BUFFER_SIZE - *offset_buffer;
+            if(bytesToRead > *bytes_written) {
+                bytesToRead = *bytes_written;
             }
 
             memcpy(new, output_buffer + *offset_buffer, bytesToRead);
             *offset_buffer += bytesToRead;
             *bytes_written -= bytesToRead;
-
 			/* Write the extra string to the new file */
 			fwrite(new, sizeof(uint8_t), bytesToRead, fpnew);
 
@@ -258,17 +275,23 @@ int main(int argc,char * argv[])
 	if ((patch_file = fopen(argv[3], "r")) == NULL)
 		err(1, "fopen(%s)", argv[3]);
 
-    int res = decode(patch_file, output_buffer, &hsd, &bytes_written, &state);
+    int res = fread(output_buffer, 1, 16, patch_file);
+    if(res != 16) {
+        err(1, "error reading magic header");
+    }
 
-	/* Read header */
     memcpy(header, output_buffer, HEADER_SIZE);
-    bytes_written -= HEADER_SIZE;
-    offset_buffer += HEADER_SIZE;
+    if(memcmp(header, "BSDIFFHS", 8) != 0)
+        errx(1, "Corrupt patch\n");
+    
+    memcpy(header, output_buffer + 8, HEADER_SIZE);
+
 	/* Read lengths from header */
 	newsize=offtin(header);
+    printf("newsize = %ld\n", newsize);
 	if(newsize<0)
 		errx(1,"Corrupt patch\n");
-
+    
 	stream.read = file_read;
 	stream.opaque = patch_file;
 	if (bspatch(newsize, &stream, argv[1], argv[2], patch_file, output_buffer, &offset_buffer, &hsd, &bytes_written, &state))
